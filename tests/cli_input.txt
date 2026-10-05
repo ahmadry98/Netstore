@@ -1,0 +1,11 @@
+UNKNOWN
+SIZE
+SET name Ahmad Rayan
+GET name
+EXISTS name
+DELETE missing
+DELETE name
+EXISTS name
+GET name
+SIZE
+EXIT

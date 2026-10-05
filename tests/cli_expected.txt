@@ -1,0 +1,11 @@
+netstore> Invalid command
+netstore> Size: 0
+netstore> OK
+netstore> Ahmad Rayan
+netstore> Yes
+netstore> Key not found
+netstore> Deleted
+netstore> No
+netstore> Key not found
+netstore> Size: 0
+netstore> Goodbye!

@@ -1,0 +1,16 @@
+# CMake build output
+/build/
+/cmake-build-*/
+/CMakeFiles/
+/CMakeCache.txt
+/cmake_install.cmake
+/CTestTestfile.cmake
+/Makefile
+/Testing/
+/compile_commands.json
+
+# Compiler and platform artifacts
+*.o
+*.a
+*.dSYM/
+.DS_Store
