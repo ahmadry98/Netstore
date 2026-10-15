@@ -18,6 +18,7 @@ add_library(netstore_core
     src/command_executor.cpp
     src/command_parser.cpp
     src/key_value_store.cpp
+    src/socket.cpp
 )
 
 target_include_directories(
@@ -32,6 +33,10 @@ set_target_properties(netstore_core PROPERTIES CXX_EXTENSIONS OFF)
 add_executable(netstore src/main.cpp)
 target_link_libraries(netstore PRIVATE netstore_core)
 set_target_properties(netstore PROPERTIES CXX_EXTENSIONS OFF)
+
+add_executable(netstore_server src/server_main.cpp)
+target_link_libraries(netstore_server PRIVATE netstore_core)
+set_target_properties(netstore_server PROPERTIES CXX_EXTENSIONS OFF)
 
 include(CTest)
 
@@ -104,6 +109,23 @@ if(BUILD_TESTING)
     catch_discover_tests(key_value_store_test DISCOVERY_MODE PRE_TEST)
     catch_discover_tests(command_parser_test DISCOVERY_MODE PRE_TEST)
     catch_discover_tests(command_executor_test DISCOVERY_MODE PRE_TEST)
+
+    add_executable(socket_test tests/socket_test.cpp)
+    target_link_libraries(socket_test PRIVATE netstore_core Catch2::Catch2WithMain)
+    set_target_properties(socket_test PROPERTIES CXX_EXTENSIONS OFF)
+    catch_discover_tests(socket_test DISCOVERY_MODE PRE_TEST)
+
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    add_test(
+        NAME netstore_tcp_test
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/server_integration_test.py
+            $<TARGET_FILE:netstore_server>
+    )
+    set_tests_properties(netstore_tcp_test PROPERTIES
+        TIMEOUT 45
+        RESOURCE_LOCK netstore_port_8080
+    )
 
     add_test(
         NAME netstore_cli_test

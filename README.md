@@ -79,10 +79,16 @@ input -> command parser -> command executor -> key-value store
 output <- owned response <----+
 ```
 
-The project is now beginning milestone 2: a blocking TCP server that serves
-one connected client at a time on `127.0.0.1:5555`. The server will introduce
-POSIX sockets, file descriptors, line-based TCP framing, and RAII resource
-management while reusing the completed milestone-1 core.
+Milestone 2 now includes a blocking TCP server on `127.0.0.1:8080`, reusing
+the same parser, executor, and store. It accepts one client per run and exits
+when that client disconnects or sends `EXIT`. Socket ownership uses RAII;
+receives and sends retry interruptions, and sends handle partial progress.
+Commands end with `\n` and may contain at most 4,096 bytes before the newline.
+Oversized commands close the connection with a server-side error. An unfinished
+command is discarded on disconnect. Data is in memory and is lost on exit.
+
+Start the server with `./build/netstore_server`, then connect from another
+terminal with `nc 127.0.0.1 8080`. Responses appear in the client terminal.
 
 ## Using the CLI
 
@@ -113,6 +119,8 @@ Requirements:
 - a compiler with C++20 support, such as a current Clang or GCC.
 - Git, which CMake uses to fetch the pinned Catch2 test dependency on the
   first test-enabled configuration.
+- Python 3 for TCP integration tests (when `BUILD_TESTING` is enabled).
+- Linux or macOS for the POSIX socket implementation.
 
 Configure and build the project from its root:
 
@@ -136,6 +144,20 @@ ctest --test-dir build --output-on-failure
 Catch2 provides named unit tests for storage, parsing, and command execution.
 A separate CTest integration test runs the actual CLI with scripted input and
 compares its complete output against the expected transcript.
+
+The `netstore_tcp_test` CTest entry runs six Python standard-library integration
+cases against the actual server: command responses and `EXIT`, fragmented
+commands, disconnects with unfinished input, the exact line-length boundary,
+many small commands, and oversized input with and without a newline. These
+tests do not force interrupted system calls or partial sends.
+
+Port 8080 must be free: stop any manually running server before testing. The
+test script starts and cleans up its own server processes and uses timeouts to
+avoid hanging. Run only the TCP suite with:
+
+```bash
+ctest --test-dir build -R netstore_tcp_test --output-on-failure
+```
 
 ## Learning workflow
 
