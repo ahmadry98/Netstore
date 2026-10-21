@@ -34,8 +34,11 @@ add_executable(netstore src/main.cpp)
 target_link_libraries(netstore PRIVATE netstore_core)
 set_target_properties(netstore PROPERTIES CXX_EXTENSIONS OFF)
 
+set(THREADS_PREFER_PTHREAD_FLAG TRUE)
+find_package(Threads REQUIRED)
+
 add_executable(netstore_server src/server_main.cpp)
-target_link_libraries(netstore_server PRIVATE netstore_core)
+target_link_libraries(netstore_server PRIVATE netstore_core Threads::Threads)
 set_target_properties(netstore_server PROPERTIES CXX_EXTENSIONS OFF)
 
 include(CTest)

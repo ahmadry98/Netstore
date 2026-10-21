@@ -68,10 +68,10 @@ EXIT
 ```
 
 Command parsing, execution, and data storage are separate components. This
-matters because the future CLI and TCP server can share the same behavior, and
+matters because the CLI and TCP server share the same behavior, and
 because each component can be tested independently.
 
-The planned flow is:
+The shared command flow is:
 
 ```text
 input -> command parser -> command executor -> key-value store
@@ -79,16 +79,39 @@ input -> command parser -> command executor -> key-value store
 output <- owned response <----+
 ```
 
-Milestone 2 now includes a blocking TCP server on `127.0.0.1:8080`, reusing
-the same parser, executor, and store. It accepts one client per run and exits
-when that client disconnects or sends `EXIT`. Socket ownership uses RAII;
-receives and sends retry interruptions, and sends handle partial progress.
+Milestones 1–3 are implemented. The TCP server listens on `127.0.0.1:8080`
+and serves concurrent clients using one C++20 `std::jthread` per connection.
+The main thread accepts connections while workers receive and process commands.
+A shared mutex protects command execution against the shared in-memory store;
+network waits happen outside that lock. `KeyValueStore` itself does not yet
+provide internal locking, so callers must coordinate access.
+
+Disconnection, `EXIT`, or a session error ends only that session. The shared
+store survives between clients, while each session owns its unfinished input.
+Worker entries and their threads share one RAII socket owner, so the descriptor
+remains valid during shutdown and is closed once. Finished workers are joined
+and removed when another connection is accepted.
+
+Ctrl+C requests shutdown using a lock-free atomic flag. The main thread polls
+the nonblocking listener at 200 ms intervals, stops accepting, shuts down client
+connections to wake blocked I/O, then joins workers before destroying the store.
+Client sockets use blocking I/O. Receives and sends retry interruptions, and
+sends handle partial progress. SIGPIPE is ignored so broken sends report errors.
 Commands end with `\n` and may contain at most 4,096 bytes before the newline.
 Oversized commands close the connection with a server-side error. An unfinished
 command is discarded on disconnect. Data is in memory and is lost on exit.
 
 Start the server with `./build/netstore_server`, then connect from another
 terminal with `nc 127.0.0.1 8080`. Responses appear in the client terminal.
+Open two client terminals to try simultaneous sessions. `EXIT` closes only the
+client that sends it; Ctrl+C in the server terminal stops the server.
+
+This is a learning implementation, not a production database: there is no cap
+on active worker threads, and logs from different workers can interleave.
+Graceful shutdown currently handles SIGINT (Ctrl+C), not SIGTERM. The tests
+have been run on macOS; Linux portability has not yet been verified by CI.
+The next milestone replaces per-client thread creation with a bounded thread
+pool. Persistence, TTL, and performance measurements are still future work.
 
 ## Using the CLI
 
@@ -145,11 +168,15 @@ Catch2 provides named unit tests for storage, parsing, and command execution.
 A separate CTest integration test runs the actual CLI with scripted input and
 compares its complete output against the expected transcript.
 
-The `netstore_tcp_test` CTest entry runs six Python standard-library integration
-cases against the actual server: command responses and `EXIT`, fragmented
-commands, disconnects with unfinished input, the exact line-length boundary,
-many small commands, and oversized input with and without a newline. These
-tests do not force interrupted system calls or partial sends.
+The `netstore_tcp_test` CTest entry runs eleven Python standard-library
+integration cases against the actual server: command responses and `EXIT`,
+fragmented commands, disconnects with unfinished input, the exact line-length
+boundary, many small commands, oversized input with and without a newline,
+storage shared across successive clients, simultaneous clients, concurrent
+writers, and SIGINT shutdown with and without connected clients.
+Tests verify that the server accepts another client after a session ends.
+These tests do not force interrupted system calls, partial sends, or allocation
+and thread-start failures; passing them is not proof of race freedom.
 
 Port 8080 must be free: stop any manually running server before testing. The
 test script starts and cleans up its own server processes and uses timeouts to
