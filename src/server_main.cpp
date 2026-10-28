@@ -1,33 +1,23 @@
-#include "command_executor.hpp"
-#include "command_parser.hpp"
 #include "key_value_store.hpp"
 #include "socket.hpp"
+#include "thread_pool.hpp"
 
 #include <atomic>
 #include <cerrno>
+#include <charconv>
 #include <csignal>
 #include <cstdio>
 #include <exception>
 #include <fcntl.h>
 #include <iostream>
-#include <memory>
-#include <mutex>
 #include <netinet/in.h>
 #include <poll.h>
-#include <string>
 #include <sys/socket.h>
-#include <thread>
+#include <stdexcept>
+#include <string>
+#include <string_view>
 #include <utility>
-#include <vector>
 
-struct Worker
-{
-    std::shared_ptr<std::atomic<bool>> finished;
-    std::shared_ptr<Socket> connection;
-    std::jthread thread;
-};
-int handle_client(int client_fd, KeyValueStore& store,
-                  std::mutex& store_mutex);
 static_assert(std::atomic<bool>::is_always_lock_free);
 std::atomic<bool> shutdown_requested{false};
 
@@ -36,8 +26,24 @@ void request_shutdown(int)
     shutdown_requested.store(true);
 }
 
-int main()
+std::size_t parse_count(const char* argument)
 {
+    const std::string_view text{argument};
+    std::size_t value = 0;
+    const auto result = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (result.ec != std::errc{} || result.ptr != text.data() + text.size()) {
+        throw std::invalid_argument("Worker count and queue capacity must be nonnegative integers");
+    }
+    return value;
+}
+
+int run_server(int argc, char** argv)
+{
+    if (argc > 3) {
+        throw std::invalid_argument("Usage: netstore_server [worker_count] [queue_capacity]");
+    }
+    const std::size_t worker_count = argc > 1 ? parse_count(argv[1]) : 4;
+    const std::size_t queue_capacity = argc > 2 ? parse_count(argv[2]) : 64;
     if (std::signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
         std::cerr << "Could not configure SIGPIPE handling\n";
         return 1;
@@ -84,11 +90,10 @@ int main()
         std::cerr << "Could not listen on socket\n";
         return 1;
     }
-    std::cout << "Waiting for a client on 127.0.0.1:8080..."
-          << std::endl;
     KeyValueStore store;
-    std::mutex store_mutex;
-    std::vector<Worker> workers;
+    ThreadPool pool{worker_count, queue_capacity, store};
+    std::cout << "Workers: " << worker_count << ", queue capacity: " << queue_capacity << '\n';
+    std::cout << "Waiting for a client on 127.0.0.1:8080..." << std::endl;
     pollfd listener{};
     listener.fd = socket.get();
     listener.events = POLLIN;
@@ -146,135 +151,21 @@ int main()
             std::perror("fcntl(client)");
             continue;
         }
-        std::erase_if(workers, [](const Worker& worker) {
-            return worker.finished->load();
-        });
         std::cout << "Client connected!\n";
-        try {
-            // Allocate vector storage before starting a thread: an allocation
-            // failure afterward could destroy and join a blocked temporary.
-            if (workers.size() == workers.capacity()) {
-                workers.reserve(workers.empty() ? 1 : workers.size() * 2);
-            }
-            auto finished = std::make_shared<std::atomic<bool>>(false);
-            auto connection = std::make_shared<Socket>(std::move(client));
-
-            workers.push_back(Worker{
-                finished,
-                connection,
-                std::jthread{
-                    [connection, &store, &store_mutex, finished]() {
-                        try {
-                            handle_client(connection->get(), store, store_mutex);
-                        } catch (const std::exception& error) {
-                            std::cerr << "Client session failed: " << error.what() << '\n';
-                        } catch (...) {
-                            std::cerr << "Client session failed\n";
-                        }
-                        ::shutdown(connection->get(), SHUT_WR);
-                        finished->store(true);
-                    }
-                }
-            });
-        } catch (const std::exception& error) {
-            std::cerr << "Could not start worker: " << error.what() << '\n';
-            exit_code = 1;
-            break;
+        if (!pool.submit(std::move(client))) {
+            std::cerr << "Connection rejected: queue full or pool stopped\n";
         }
     }
-    for (const Worker& worker : workers) {
-        ::shutdown(worker.connection->get(), SHUT_RDWR);
-    }
-
-    workers.clear();
-
+    pool.stop();
     return exit_code;
 }
 
-int handle_client(int client_fd, KeyValueStore& store,
-                  std::mutex& store_mutex)
+int main(int argc, char** argv)
 {
-    char buffer[1024]{};
-    std::string pending;
-    constexpr std::size_t max_line_size = 4096;
-    while (true) {
-        const auto bytes_received = ::recv(
-            client_fd,
-            buffer,
-            sizeof(buffer),
-            0
-        );
-        if (bytes_received == -1) {
-            if (errno == EINTR) {
-                continue;
-            }
-            std::cerr << "Could not receive data from client\n";
-            return 1;
-        }
-        if (bytes_received == 0) {
-            std::cout << "Client disconnected\n";
-            return 0;
-        }
-        pending.append(buffer, static_cast<std::size_t>(bytes_received));
-        while (true) {
-            const auto newline = pending.find('\n');
-
-            if (newline == std::string::npos) {
-                if (pending.size() > max_line_size) {
-                    std::cerr << "Command too long\n";
-                    return 1;
-                }
-                break;
-            }
-
-            if (newline > max_line_size) {
-                std::cerr << "Command too long\n";
-                return 1;
-            }
-            const std::string line = pending.substr(0, newline);
-            pending.erase(0, newline + 1);
-            const auto command = parse_command(line);
-
-            std::string response;
-            bool should_exit = false;
-
-            if (!command.has_value()) {
-                response = "Invalid command\n";
-            } else {
-                std::lock_guard<std::mutex> lock{store_mutex};
-                const auto result = execute_command(*command, store);
-                response = result.response + '\n';
-                should_exit = result.should_exit;
-            }
-            std::size_t total_sent = 0;
-
-            while (total_sent < response.size()) {
-                const auto bytes_sent = ::send(
-                    client_fd,
-                    response.data() + total_sent,
-                    response.size() - total_sent,
-                    0
-                );
-                if (bytes_sent == -1 && errno == EINTR) {
-                    continue;
-                }
-                if (bytes_sent <= 0) {
-                    std::cerr << "Could not send response\n";
-                    return 1;
-                }
-
-                total_sent += static_cast<std::size_t>(bytes_sent);
-            }
-            std::cout << response;
-            if (should_exit) {
-                return 0;
-            }
-            std::cout << "Command line: " << line << '\n';
-        }
-
-        std::cout << "Descriptor: " << client_fd << '\n';
-        std::cout << "Received: ";
-        std::cout.write(buffer, bytes_received);
-        std::cout << '\n';
+    try {
+        return run_server(argc, argv);
+    } catch (const std::exception& error) {
+        std::cerr << "Server failed: " << error.what() << '\n';
+        return 1;
     }
 }

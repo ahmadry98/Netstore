@@ -20,11 +20,12 @@ SERVER = str(Path(sys.argv.pop(1)).resolve())
 
 
 @contextlib.contextmanager
-def running_server(connect_client=True):
+def running_server(connect_client=True, worker_count=4, queue_capacity=64):
     # A file drains verbose server output without risking a full stdout pipe.
     with tempfile.TemporaryFile(mode="w+b") as output:
         process = subprocess.Popen(
-            [SERVER], stdout=output, stderr=subprocess.STDOUT
+            [SERVER, str(worker_count), str(queue_capacity)],
+            stdout=output, stderr=subprocess.STDOUT
         )
 
         def logs():
@@ -56,6 +57,10 @@ def running_server(connect_client=True):
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait(timeout=2)
+            diagnostics = logs()
+            for marker in ("ERROR: AddressSanitizer", "ERROR: LeakSanitizer", "runtime error:"):
+                if marker in diagnostics:
+                    raise AssertionError(f"Sanitizer reported a failure:\n{diagnostics}")
 
 
 def receive_line(client):
@@ -69,6 +74,49 @@ def receive_line(client):
 
 
 class ServerIntegrationTests(unittest.TestCase):
+    def test_bounded_pool_queues_rejects_overflow_and_reuses_worker(self):
+        with running_server(worker_count=1, queue_capacity=1) as (process, active, logs):
+            active.sendall(b"SET name Ahmad\n")
+            self.assertEqual(receive_line(active), b"OK\n")
+            with socket.create_connection(("127.0.0.1", 8080), timeout=3) as queued:
+                queued.sendall(b"GET name\n")
+                queued.settimeout(0.15)
+                with self.assertRaises(socket.timeout):
+                    queued.recv(1)
+                queued.settimeout(3)
+                with socket.create_connection(("127.0.0.1", 8080), timeout=3) as overflow:
+                    self.assertEqual(overflow.recv(1), b"")
+
+                active.sendall(b"EXIT\n")
+                self.assertEqual(receive_line(active), b"Goodbye!\n")
+                self.assertEqual(active.recv(1), b"")
+                self.assertEqual(receive_line(queued), b"Ahmad\n")
+                queued.sendall(b"EXIT\n")
+                self.assertEqual(receive_line(queued), b"Goodbye!\n")
+                self.assertEqual(queued.recv(1), b"")
+            self.assert_session_closed(process, active, logs)
+
+    def test_shutdown_discards_idle_queued_clients(self):
+        with running_server(worker_count=1, queue_capacity=2) as (process, active, logs):
+            active.sendall(b"SIZE\n")
+            self.assertEqual(receive_line(active), b"Size: 0\n")
+            with socket.create_connection(("127.0.0.1", 8080), timeout=3) as queued:
+                # No data: draining this as a normal session would hang shutdown.
+                process.send_signal(signal.SIGINT)
+                self.assertEqual(process.wait(timeout=3), 0, logs())
+                self.assertEqual(active.recv(1), b"")
+                try:
+                    self.assertEqual(queued.recv(1), b"")
+                except ConnectionResetError:
+                    pass # A connection still in the kernel backlog can reset.
+
+    def test_invalid_pool_arguments_fail(self):
+        for arguments in (("0",), ("-1",), ("abc",), ("4", "abc"), ("4", "64", "extra")):
+            with self.subTest(arguments=arguments):
+                result = subprocess.run([SERVER, *arguments], capture_output=True, timeout=3)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(b"Server failed:", result.stderr)
+
     def test_concurrent_writers_preserve_all_keys(self):
         with running_server(connect_client=False) as (process, _, logs):
             def write_keys(worker):

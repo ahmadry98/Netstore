@@ -15,10 +15,13 @@ add_compile_options(
 )
 
 add_library(netstore_core
+    src/client_session.cpp
     src/command_executor.cpp
     src/command_parser.cpp
+    src/connection_queue.cpp
     src/key_value_store.cpp
     src/socket.cpp
+    src/thread_pool.cpp
 )
 
 target_include_directories(
@@ -36,6 +39,7 @@ set_target_properties(netstore PROPERTIES CXX_EXTENSIONS OFF)
 
 set(THREADS_PREFER_PTHREAD_FLAG TRUE)
 find_package(Threads REQUIRED)
+target_link_libraries(netstore_core PUBLIC Threads::Threads)
 
 add_executable(netstore_server src/server_main.cpp)
 target_link_libraries(netstore_server PRIVATE netstore_core Threads::Threads)
@@ -117,6 +121,19 @@ if(BUILD_TESTING)
     target_link_libraries(socket_test PRIVATE netstore_core Catch2::Catch2WithMain)
     set_target_properties(socket_test PROPERTIES CXX_EXTENSIONS OFF)
     catch_discover_tests(socket_test DISCOVERY_MODE PRE_TEST)
+
+    add_executable(connection_queue_test tests/connection_queue_test.cpp)
+    target_link_libraries(connection_queue_test PRIVATE
+        netstore_core Catch2::Catch2WithMain)
+    set_target_properties(connection_queue_test PROPERTIES CXX_EXTENSIONS OFF)
+    catch_discover_tests(connection_queue_test DISCOVERY_MODE PRE_TEST
+        PROPERTIES TIMEOUT 10)
+
+    add_executable(thread_pool_test tests/thread_pool_test.cpp)
+    target_link_libraries(thread_pool_test PRIVATE netstore_core Catch2::Catch2WithMain)
+    set_target_properties(thread_pool_test PROPERTIES CXX_EXTENSIONS OFF)
+    catch_discover_tests(thread_pool_test DISCOVERY_MODE PRE_TEST
+        PROPERTIES TIMEOUT 10)
 
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     add_test(

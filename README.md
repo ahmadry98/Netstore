@@ -79,22 +79,27 @@ input -> command parser -> command executor -> key-value store
 output <- owned response <----+
 ```
 
-Milestones 1–3 are implemented. The TCP server listens on `127.0.0.1:8080`
-and serves concurrent clients using one C++20 `std::jthread` per connection.
-The main thread accepts connections while workers receive and process commands.
+Milestones 1–4 are implemented. The TCP server listens on `127.0.0.1:8080`
+and serves clients using a fixed C++20 `std::jthread` pool (four workers by
+default) and a bounded FIFO queue (64 waiting connections by default).
+The main thread accepts and queues connections while reusable workers receive
+and process commands. A full queue rejects and closes a newly accepted socket.
 A shared mutex protects command execution against the shared in-memory store;
 network waits happen outside that lock. `KeyValueStore` itself does not yet
 provide internal locking, so callers must coordinate access.
 
 Disconnection, `EXIT`, or a session error ends only that session. The shared
 store survives between clients, while each session owns its unfinished input.
-Worker entries and their threads share one RAII socket owner, so the descriptor
-remains valid during shutdown and is closed once. Finished workers are joined
-and removed when another connection is accepted.
+Socket ownership moves from the accept thread into the queue, then to a worker.
+Each active session also has a shared owner in the pool's active-slot registry
+so shutdown can safely access its descriptor. On session completion the slot
+is cleared, the socket closes, and the same worker takes the next connection.
 
 Ctrl+C requests shutdown using a lock-free atomic flag. The main thread polls
 the nonblocking listener at 200 ms intervals, stops accepting, shuts down client
-connections to wake blocked I/O, then joins workers before destroying the store.
+connections to wake blocked I/O, discards queued clients, then joins workers
+before destroying the store. The pool destructor also stops the pool, including
+cleanup if starting the fixed set of workers fails partway through construction.
 Client sockets use blocking I/O. Receives and sends retry interruptions, and
 sends handle partial progress. SIGPIPE is ignored so broken sends report errors.
 Commands end with `\n` and may contain at most 4,096 bytes before the newline.
@@ -106,12 +111,25 @@ terminal with `nc 127.0.0.1 8080`. Responses appear in the client terminal.
 Open two client terminals to try simultaneous sessions. `EXIT` closes only the
 client that sends it; Ctrl+C in the server terminal stops the server.
 
-This is a learning implementation, not a production database: there is no cap
-on active worker threads, and logs from different workers can interleave.
+Optional positional arguments configure worker count and waiting-queue capacity:
+
+```bash
+./build/netstore_server 4 64
+```
+
+Worker count must be positive. Queue capacity may be zero, which rejects all
+submissions. The queue limit is separate from the kernel's TCP listen backlog.
+See [the thread-pool walkthrough](docs/thread_pool.md) for ownership, locking,
+shutdown, and a manual queue-saturation exercise.
+
+This is a learning implementation, not a production database. Workers handle
+whole blocking client sessions: four idle clients can occupy all four workers,
+leaving later clients queued. There are no idle timeouts, authentication, or TLS,
+and logs from different workers can interleave.
 Graceful shutdown currently handles SIGINT (Ctrl+C), not SIGTERM. The tests
 have been run on macOS; Linux portability has not yet been verified by CI.
-The next milestone replaces per-client thread creation with a bounded thread
-pool. Persistence, TTL, and performance measurements are still future work.
+The next milestone moves synchronization into the store itself. Persistence,
+TTL, and performance measurements are still future work.
 
 ## Using the CLI
 
@@ -164,16 +182,20 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-Catch2 provides named unit tests for storage, parsing, and command execution.
+Catch2 provides named unit tests for storage, parsing, command execution,
+socket ownership, the bounded queue, and the thread pool. Pool tests exercise
+overflow rejection, worker reuse, destructor cleanup, repeated/concurrent stop,
+and shutdown with active and queued connections. Test timeouts detect hangs.
 A separate CTest integration test runs the actual CLI with scripted input and
 compares its complete output against the expected transcript.
 
-The `netstore_tcp_test` CTest entry runs eleven Python standard-library
+The `netstore_tcp_test` CTest entry runs fourteen Python standard-library
 integration cases against the actual server: command responses and `EXIT`,
 fragmented commands, disconnects with unfinished input, the exact line-length
 boundary, many small commands, oversized input with and without a newline,
 storage shared across successive clients, simultaneous clients, concurrent
-writers, and SIGINT shutdown with and without connected clients.
+writers, SIGINT shutdown with and without connected clients, bounded-pool
+saturation, shutdown with queued clients, and invalid pool arguments.
 Tests verify that the server accepts another client after a session ends.
 These tests do not force interrupted system calls, partial sends, or allocation
 and thread-start failures; passing them is not proof of race freedom.
@@ -185,6 +207,20 @@ avoid hanging. Run only the TCP suite with:
 ```bash
 ctest --test-dir build -R netstore_tcp_test --output-on-failure
 ```
+
+An AddressSanitizer/UndefinedBehaviorSanitizer build can be checked with:
+
+```bash
+cmake -S . -B build-sanitize -DBUILD_TESTING=OFF \
+  -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g" \
+  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+cmake --build build-sanitize
+UBSAN_OPTIONS=halt_on_error=1 python3 tests/server_integration_test.py \
+  ./build-sanitize/netstore_server
+```
+
+This checks the running server; it does not run Catch2 under sanitizers or
+replace ThreadSanitizer testing. No throughput or latency claims are made yet.
 
 ## Learning workflow
 
